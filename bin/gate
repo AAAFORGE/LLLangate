@@ -1,0 +1,185 @@
+#!/bin/zsh
+# gate — manage a Langate installation.
+#   gate status | start | stop | allow <ssid|--current> | deny <ssid>
+#   gate list | token | rotate-token | doctor | logs [caddy|gate] [N]
+set -u
+
+GATE_DIR="$HOME/.config/langate"
+[[ -f "$GATE_DIR/config.env" ]] || { echo "Langate is not installed (no $GATE_DIR/config.env). Run install.sh first." >&2; exit 1; }
+source "$GATE_DIR/config.env"
+
+LABEL_CADDY="com.langate.caddy"
+LABEL_GATE="com.langate.gate"
+CADDY_PLIST="$HOME/Library/LaunchAgents/com.langate.caddy.plist"
+GATE_PLIST="$HOME/Library/LaunchAgents/com.langate.gate.plist"
+UID_N=$(id -u)
+ALLOWED_FILE="$GATE_DIR/allowed-ssids.txt"
+
+ssid() {
+  local s
+  s=$(ipconfig getsummary en0 2>/dev/null | awk -F': ' '/^ *SSID/ {print $2; exit}')
+  [[ -z "$s" ]] && s=$(networksetup -getairportnetwork en0 2>/dev/null | sed -E 's/.*: //')
+  print -r -- "$s"
+}
+loaded()     { launchctl print "gui/$UID_N/$1" >/dev/null 2>&1; }
+caddy_pid()  { pgrep -f -- "caddy run --config $GATE_DIR/Caddyfile" 2>/dev/null; }
+gate_link()  { print -r -- "https://$HOSTNAME:$PORT_HTTPS/gate?t=$TOKEN"; }
+kick()       { launchctl kickstart "gui/$UID_N/$LABEL_GATE" 2>/dev/null || true; }
+
+ok()   { print -P " %F{green}✓%f $*"; }
+bad()  { print -P " %F{red}✗%f $*"; }
+warn() { print -P " %F{yellow}▲%f $*"; }
+
+cmd_status() {
+  local S c_pid
+  S=$(ssid); c_pid=$(caddy_pid)
+  echo "Langate status"
+  echo "──────────────"
+  echo "  entry:       https://$HOSTNAME:$PORT_HTTPS  →  http://$UPSTREAM"
+  echo "  Wi-Fi now:   ${S:-<none>}"
+  if [[ -n "$S" ]] && grep -qxF -- "$S" "$ALLOWED_FILE" 2>/dev/null; then
+    ok "allowed (in allowlist)"
+  else
+    warn "NOT in allowlist — entry stays closed on this network"
+  fi
+  if loaded "$LABEL_GATE"; then ok "gate agent: loaded (tick every 60s)"; else bad "gate agent: not loaded"; fi
+  if loaded "$LABEL_CADDY"; then ok "caddy job: loaded"; else echo "  caddy job:   not loaded (entry closed)"; fi
+  if [[ -n "$c_pid" ]]; then ok "caddy process: running (pid $c_pid)"; else echo "  caddy process: stopped"; fi
+  echo ""
+  echo "  last events:"
+  tail -n 3 "$GATE_DIR/gate.log" 2>/dev/null | sed 's/^/    /'
+  [[ -t 1 ]] || true
+}
+
+cmd_start() {
+  if loaded "$LABEL_GATE"; then
+    kick; echo "Gate agent kicked — caddy follows the allowlist again."
+  else
+    launchctl bootstrap "gui/$UID_N" "$GATE_PLIST" && echo "Gate agent started."
+  fi
+}
+
+cmd_stop() {
+  launchctl bootout "gui/$UID_N/$LABEL_GATE" 2>/dev/null || true
+  launchctl bootout "gui/$UID_N/$LABEL_CADDY" 2>/dev/null || true
+  echo "$(date '+%F %T') MANUAL stop via gate CLI" >> "$GATE_DIR/gate.log"
+  echo "Langate fully stopped (gate agent + caddy). Run 'gate start' to resume."
+}
+
+cmd_allow() {
+  local S="${1:-}"
+  if [[ "$S" == "--current" || -z "$S" ]]; then S=$(ssid); fi
+  [[ -n "$S" ]] || { echo "No SSID detected; pass one: gate allow <ssid>" >&2; exit 1; }
+  if grep -qxF -- "$S" "$ALLOWED_FILE" 2>/dev/null; then
+    echo "Already allowed: $S"
+  else
+    printf '%s\n' "$S" >> "$ALLOWED_FILE"
+    echo "Allowed: $S"
+  fi
+  kick
+  echo "Applied — entry should be up within a second."
+}
+
+cmd_deny() {
+  local S="${1:-}"
+  [[ -n "$S" ]] || { echo "usage: gate deny <ssid>" >&2; exit 1; }
+  local tmp="$ALLOWED_FILE.tmp"
+  grep -vxF -- "$S" "$ALLOWED_FILE" 2>/dev/null > "$tmp" || true
+  mv "$tmp" "$ALLOWED_FILE"
+  echo "Denied: $S"
+  kick
+}
+
+cmd_list() {
+  echo "Allowed Wi-Fi networks:"
+  nl -ba "$ALLOWED_FILE" 2>/dev/null | sed 's/^/  /'
+}
+
+cmd_token() {
+  echo "Gate link (opens entry on any device in an allowed network):"
+  echo "  $(gate_link)"
+  if command -v qrencode >/dev/null 2>&1; then
+    echo ""
+    qrencode -t ANSIUTF8 "$(gate_link)"
+  else
+    echo "(tip: brew install qrencode to get a scannable QR here)"
+  fi
+}
+
+cmd_rotate() {
+  local NEW OLD="$TOKEN"
+  NEW="$(openssl rand -hex 16)"
+  sed -i '' "s/$OLD/$NEW/g" "$GATE_DIR/Caddyfile"
+  sed -i '' "s/^TOKEN=.*/TOKEN=$NEW/" "$GATE_DIR/config.env"
+  launchctl kickstart -k "gui/$UID_N/$LABEL_CADDY" 2>/dev/null || true
+  echo "Token rotated. Old gate links are dead."
+  echo "New gate link: https://$HOSTNAME:$PORT_HTTPS/gate?t=$NEW"
+}
+
+cmd_doctor() {
+  local fails=0 warns=0 S c_pid
+  S=$(ssid); c_pid=$(caddy_pid)
+
+  check() { # ok|warn|fail  message
+    case "$1" in
+      ok)   ok "$2" ;;
+      warn) warn "$2"; warns=$((warns+1)) ;;
+      fail) bad "$2"; fails=$((fails+1)) ;;
+    esac
+  }
+
+  [[ -x "$CADDY_BIN" ]] && check ok "caddy binary ($CADDY_BIN)" || check fail "caddy binary missing ($CADDY_BIN)"
+  [[ -f "$GATE_DIR/Caddyfile" ]] && check ok "Caddyfile present" || check fail "Caddyfile missing"
+  [[ -f "$GATE_DIR/gate-tick.sh" ]] && check ok "gate-tick.sh present" || check fail "gate-tick.sh missing"
+  loaded "$LABEL_GATE" && check ok "gate agent loaded" || check warn "gate agent not loaded (run: gate start)"
+  [[ -n "$c_pid" ]] && check ok "caddy running (pid $c_pid)" || check warn "caddy not running — entry closed"
+  if [[ -n "$S" ]] && grep -qxF -- "$S" "$ALLOWED_FILE" 2>/dev/null; then
+    check ok "current Wi-Fi '$S' is allowed"
+  else
+    check warn "current Wi-Fi '${S:-<none>}' not allowed — entry closed here by design"
+  fi
+  if curl -s -o /dev/null --max-time 3 "http://$UPSTREAM"; then
+    check ok "upstream http://$UPSTREAM reachable"
+  else
+    check fail "upstream http://$UPSTREAM unreachable"
+  fi
+  if [[ -n "$c_pid" ]] && nc -z 127.0.0.1 "$PORT_HTTPS" 2>/dev/null; then
+    check ok "https port $PORT_HTTPS listening"
+  elif [[ -n "$c_pid" ]]; then
+    check fail "caddy runs but port $PORT_HTTPS is not listening (check caddy.log)"
+  fi
+  [[ -f "$GATE_DIR/caddy-storage/pki/authorities/local/root.crt" ]] \
+    && check ok "root.crt present" || check warn "root.crt not found yet (created on first caddy start)"
+
+  echo ""
+  if (( fails > 0 )); then echo "doctor: $fails failure(s), $warns warning(s)"; exit 1; fi
+  echo "doctor: all good ($warns warning(s))"
+}
+
+cmd_logs() {
+  local which="${1:-gate}" n="${2:-30}"
+  case "$which" in
+    caddy) tail -n "$n" "$GATE_DIR/caddy.log" ;;
+    gate)  tail -n "$n" "$GATE_DIR/gate.log" ;;
+    *) echo "usage: gate logs [caddy|gate] [N]" >&2; exit 1 ;;
+  esac
+}
+
+case "${1:-help}" in
+  status)       cmd_status ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  allow)        shift; cmd_allow "$@" ;;
+  deny)         shift; cmd_deny "$@" ;;
+  list)         cmd_list ;;
+  token)        cmd_token ;;
+  rotate-token) cmd_rotate ;;
+  doctor)       cmd_doctor ;;
+  logs)         shift; cmd_logs "$@" ;;
+  help|--help|-h)
+    sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)
+    echo "unknown command: $1" >&2
+    sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' >&2
+    exit 1 ;;
+esac

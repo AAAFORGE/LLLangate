@@ -1,0 +1,39 @@
+#!/bin/zsh
+# Langate gate tick — Wi-Fi allowlist state machine.
+# Runs via launchd (com.langate.gate) every 60s and on network changes.
+# Caddy lives in its OWN launchd job (com.langate.caddy, KeepAlive);
+# this script only bootstraps/bootouts that job. Never spawn caddy directly:
+# a process spawned here dies with the job's process group when the script exits.
+
+GATE_DIR="__GATE_DIR__"
+ALLOWED_FILE="$GATE_DIR/allowed-ssids.txt"
+CADDY_PLIST="$HOME/Library/LaunchAgents/com.langate.caddy.plist"
+GATE_LOG="$GATE_DIR/gate.log"
+LABEL="com.langate.caddy"
+UID_N=$(id -u)
+
+log() { echo "$(date '+%F %T') $*" >>"$GATE_LOG"; }
+
+# --- 1. current Wi-Fi SSID ---
+SSID=$(ipconfig getsummary en0 2>/dev/null | awk -F': ' '/^ *SSID/ {print $2; exit}')
+[[ -z "$SSID" ]] && SSID=$(networksetup -getairportnetwork en0 2>/dev/null | sed -E 's/.*: //')
+
+# --- 2. allowlist check (empty SSID / missing file = deny) ---
+allowed=0
+[[ -n "$SSID" ]] && grep -qxF -- "$SSID" "$ALLOWED_FILE" 2>/dev/null && allowed=1
+
+# --- 3. caddy running? ---
+RUNNING=$(pgrep -f -- "caddy run --config $GATE_DIR/Caddyfile" 2>/dev/null)
+
+# --- 4. state machine ---
+if (( allowed )) && [[ -z "$RUNNING" ]]; then
+  if launchctl bootstrap gui/${UID_N} "$CADDY_PLIST" 2>/dev/null; then
+    log "START ok   ssid=$SSID (launchd)"
+  else
+    launchctl kickstart gui/${UID_N}/${LABEL} 2>/dev/null && log "START ok   ssid=$SSID (kickstart)" || log "START FAIL ssid=$SSID"
+  fi
+elif (( ! allowed )) && [[ -n "$RUNNING" ]]; then
+  launchctl bootout gui/${UID_N}/${LABEL} 2>>"$GATE_LOG"
+  log "STOP ok    ssid=${SSID:-none} (bootout)"
+fi
+exit 0

@@ -1,0 +1,32 @@
+{
+	admin off
+	storage file_system {
+		root "__CADDY_STORAGE__"
+	}
+}
+
+https://__HOSTNAME__:__PORT_HTTPS__ {
+	tls internal
+	@gated not header Cookie *langate_gate=__TOKEN__*
+	handle /gate {
+		@correctt query t=__TOKEN__
+		@wrongt not query t=__TOKEN__
+		header @correctt Set-Cookie "langate_gate=__TOKEN__; Max-Age=31536000; Path=/; HttpOnly; SameSite=Lax"
+		redir @correctt https://__HOSTNAME__:__PORT_HTTPS__/ 302
+		respond @wrongt "Forbidden" 403
+	}
+	handle {
+		respond @gated "Langate: visit the gate link once first (run `gate token` on this Mac)" 401
+		reverse_proxy __UPSTREAM__
+	}
+}
+
+http://__HOSTNAME__:__PORT_CERT__ {
+	root * "__CADDY_STORAGE__/pki/authorities/local"
+	handle /root.crt {
+		file_server
+	}
+	handle {
+		respond "This port only serves root.crt" 404
+	}
+}

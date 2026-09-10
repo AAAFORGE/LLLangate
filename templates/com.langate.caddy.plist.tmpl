@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.langate.caddy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CADDY_BIN__</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>__GATE_DIR__/Caddyfile</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__GATE_DIR__/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>__GATE_DIR__/caddy.log</string>
+</dict>
+</plist>
